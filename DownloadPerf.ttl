@@ -1,0 +1,185 @@
+; DownloadPerf.ttl (Tera Term 5 / Windows 11 / RHEL 9.8)
+; Run TTPMACRO.EXE against this .ttl file.
+; Requires VerifyAndExtractPerf.ps1 in the same directory.
+;
+; Edit the following THREE values for your environment.
+HOST        = '192.0.2.10'       ; Replace with the real RHEL hostname / IP.
+SOURCE_PARENT = '/opt/myapp'    ; Download SOURCE_PARENT/perf recursively.
+LOCAL_BASE  = 'C:\PerfDownloads'
+;
+; SSH user is fixed. Tera Term prompts for the SSH password safely.
+; To use Pageant, replace /auth=password ... /ask4passwd with
+; /auth=pageant /user=spfai001 in the connection string below.
+SSH_USER    = 'spfai001'
+SSH_PORT    = '22'
+TRANSFER_TIMEOUT = 3600        ; Local SCP wait time, seconds.
+ARCHIVE_TIMEOUT  = 3600        ; Server-side tar/checksum timeout, seconds.
+
+errText   = ''
+remoteDir = ''
+remoteArchive = ''
+
+; Only simple absolute Linux paths are accepted to prevent shell injection.
+strmatch SOURCE_PARENT '^/[A-Za-z0-9_./-]*$'
+if result = 0 then
+    errText = 'SOURCE_PARENT must be an absolute Linux path using A-Z, 0-9, _, -, ., / only.'
+    goto failed
+endif
+strscan SOURCE_PARENT '..'
+if result != 0 then
+    errText = 'SOURCE_PARENT must not contain ..'
+    goto failed
+endif
+strmatch HOST '^[A-Za-z0-9.-]+$'
+if result = 0 then
+    errText = 'HOST contains invalid characters.'
+    goto failed
+endif
+
+; Create a fresh local destination folder.
+foldersearch LOCAL_BASE
+if result = 0 then
+    foldercreate LOCAL_BASE
+    if result != 0 then
+        errText = 'Unable to create LOCAL_BASE (check drive and permissions).'
+        goto failed
+    endif
+endif
+gettime stamp '%Y%m%d_%H%M%S'
+runDir = LOCAL_BASE
+strconcat runDir '\'
+strconcat runDir HOST
+strconcat runDir '_'
+strconcat runDir stamp
+foldercreate runDir
+if result != 0 then
+    errText = 'Cannot create destination folder (or it already exists).'
+    goto failed
+endif
+localArchive = runDir
+strconcat localArchive '\perf.tar.gz'
+getdir macroDir
+helper = macroDir
+strconcat helper '\VerifyAndExtractPerf.ps1'
+filesearch helper
+if result = 0 then
+    errText = 'VerifyAndExtractPerf.ps1 was not found in the macro directory.'
+    goto failed
+endif
+
+; Start SSH session. No password is stored in this macro.
+conn = HOST
+strconcat conn ':'
+strconcat conn SSH_PORT
+strconcat conn ' /ssh /2 /auth=password /user='
+strconcat conn SSH_USER
+strconcat conn ' /ask4passwd'
+connect conn
+if result != 2 then
+    errText = 'SSH connection failed (check host, network, credentials, and host key).'
+    goto failed
+endif
+
+; Verify the initial login account. No prompt string dependency.
+timeout = 60
+sendln 'printf "TT_USER_%s\n" "$(id -un)"'
+waitregex '^TT_USER_spfai001$'
+if result = 0 then
+    errText = 'SSH login did not reach the spfai001 shell.'
+    goto failed
+endif
+
+; su - requires the root password and interactive TTY.
+; This environment is expected to prompt in English (LC_ALL=C).
+sendln 'LC_ALL=C su -'
+timeout = 45
+wait 'Password:' 'password:'
+if result = 0 then
+    errText = 'su password prompt not seen; confirm su is permitted and uses Password:.'
+    goto failed
+endif
+passwordbox 'Enter the root password for su (not stored).' 'RHEL root password'
+rootPassword = inputstr
+inputstr = ''
+if rootPassword = '' then
+    errText = 'Empty root password or cancelled input.'
+    goto failed
+endif
+sendln rootPassword
+rootPassword = ''
+
+; Verify UID=0 before accessing protected files.
+timeout = 60
+sendln 'printf "TT_ROOT_%s\n" "$(id -u)"'
+waitregex '^TT_ROOT_0$'
+if result = 0 then
+    errText = 'su did not produce a root shell (wrong password or su denied).'
+    goto failed
+endif
+
+; Stage a tar.gz in a private mktemp directory. chown makes it SCP-readable
+; by the original SSH user; do NOT make this archive world-readable.
+; Failures leave no root-owned staging directory.
+sourceCmd = 's="'
+strconcat sourceCmd SOURCE_PARENT
+strconcat sourceCmd '"'
+sendln sourceCmd
+remoteCmd = 'umask 077; d=$(mktemp -d /var/tmp/perf_spfai001_XXXXXXXX); if [ -n "$d" ] && [ -d "$s/perf" ] && [ ! -L "$s/perf" ] && tar -C "$s" -czf "$d/perf.tar.gz" perf && chown -R spfai001 "$d"; then printf "TT_OK:%s:%s:%s\n" "$d" "$(stat -c %s "$d/perf.tar.gz")" "$(sha256sum "$d/perf.tar.gz" | cut -c1-64)"; else [ -z "$d" ] || rm -rf -- "$d"; echo TT_STAGE_FAILED; fi'
+sendln remoteCmd
+timeout = ARCHIVE_TIMEOUT
+waitregex '^TT_OK:(/var/tmp/perf_spfai001_[A-Za-z0-9]{8}):([0-9]+):([a-f0-9]{64})$' '^TT_STAGE_FAILED$'
+if result != 1 then
+    errText = 'Failed to archive SOURCE_PARENT/perf, or server timed out.'
+    goto failed
+endif
+remoteDir = groupmatchstr1
+expectedBytes = groupmatchstr2
+expectedHash = groupmatchstr3
+remoteArchive = remoteDir
+strconcat remoteArchive '/perf.tar.gz'
+
+; Tera Term scprecv is ASYNCHRONOUS, so the PowerShell helper waits until
+; the complete archive matches the size and SHA-256 from the RHEL server.
+scprecv remoteArchive localArchive
+
+psCmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "'
+strconcat psCmd helper
+strconcat psCmd '" -Archive "'
+strconcat psCmd localArchive
+strconcat psCmd '" -OutputDirectory "'
+strconcat psCmd runDir
+strconcat psCmd '" -ExpectedBytes "'
+strconcat psCmd expectedBytes
+strconcat psCmd '" -ExpectedHash "'
+strconcat psCmd expectedHash
+strconcat psCmd '" -TimeoutSeconds '
+int2str timeoutString TRANSFER_TIMEOUT
+strconcat psCmd timeoutString
+exec psCmd 'hide' 1
+if result != 0 then
+    errText = 'Transfer, SHA-256 verification, or extraction failed. Check verify_extract.log in the output folder. Root staging was preserved.'
+    goto failed
+endif
+
+; Delete remote staging only after successful local integrity validation.
+cleanupCmd = 'rm -rf -- "'
+strconcat cleanupCmd remoteDir
+strconcat cleanupCmd '" && echo TT_CLEAN_OK || echo TT_CLEAN_FAILED'
+sendln cleanupCmd
+timeout = 60
+waitregex '^TT_CLEAN_OK$' '^TT_CLEAN_FAILED$'
+if result != 1 then
+    messagebox 'Download OK, but remote temporary files may remain under /var/tmp. Please check.' 'Cleanup warning'
+endif
+sendln 'exit'
+sendln 'exit'
+messagebox runDir 'perf download completed (SHA-256 verified)'
+end
+
+:failed
+if remoteDir != '' then
+    strconcat errText '\nRemote staging directory: '
+    strconcat errText remoteDir
+endif
+messagebox errText 'DownloadPerf ERROR'
+end
